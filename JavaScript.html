@@ -1,0 +1,406 @@
+let TOKEN = '', ME = null, CURRENT = 'dashboard', BUSY = false;
+let TX_LINES = [], TX_DATA = null, COUNT_OPEN = null;
+const $ = id => document.getElementById(id);
+const READ_ANY = ['manage_items', 'receive_stock', 'issue_stock', 'adjust_stock', 'transfer_stock', 'confirm_transfers', 'stock_count', 'view_reports'];
+const NAV_PERMS = {
+  dashboard: null, password: null,
+  inventory: ['view_reports'], reports: ['view_reports'],
+  items: READ_ANY, categories: READ_ANY, units: READ_ANY, locations: READ_ANY.concat(['manage_locations']),
+  suppliers: ['manage_items', 'receive_stock'], users: ['manage_users'],
+  transactions: ['receive_stock', 'issue_stock', 'adjust_stock', 'approve_transactions'],
+  transfers: ['transfer_stock', 'confirm_transfers', 'view_reports'], counts: ['stock_count']
+};
+const TITLES = { dashboard: 'Dashboard', inventory: 'Inventory', items: 'Items', locations: 'Locations', categories: 'Categories', units: 'Units', suppliers: 'Suppliers', users: 'Users & access', transactions: 'Transactions', transfers: 'Stock transfers', counts: 'Stock counts', reports: 'Reports', password: 'Change password' };
+
+/* ---------- helpers ---------- */
+function toast(msg, err = false) { const t = $('toast'); t.textContent = msg; t.className = 'toast' + (err ? ' error' : ''); t.style.display = 'block'; clearTimeout(window.__toastTimer); window.__toastTimer = setTimeout(() => t.style.display = 'none', 4500); }
+function esc(s) { return String(s == null ? '' : s).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c])); }
+function fmt(s) { return esc(String(s || '').replace('T', ' ')); }
+function money(n) { return '₱' + Number(n).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 }); }
+function can(list) { return !list || !ME || ME.role === 'BusinessAdmin' || list.some(p => ME.perms.includes(p)); }
+function call(fn, ...args) {
+  return new Promise((resolve, reject) => google.script.run.withSuccessHandler(resolve).withFailureHandler(e => {
+    const m = e && e.message ? e.message : String(e);
+    if (/Session expired|Account is inactive/.test(m)) { TOKEN = ''; ME = null; showAuth(); }
+    reject(new Error(m.replace(/^Error:\s*/, '')));
+  })[fn](...args));
+}
+/** Isang gawain lang sa isang pagkakataon (iwas double-click / double-post). */
+async function run(fn) {
+  if (BUSY) return;
+  BUSY = true; document.body.style.cursor = 'progress';
+  try { await fn(); } catch (e) { toast(e.message, true); } finally { BUSY = false; document.body.style.cursor = ''; }
+}
+function panel(title, body, actions = '') { return `<section class="panel"><div class="panel-head"><h2>${title}</h2>${actions}</div>${body}</section>`; }
+function stat(label, value, hint) { return `<div class="stat"><div class="label">${label}</div><div class="value">${value}</div><div class="hint">${hint || ''}</div></div>`; }
+function table(headers, rows) { return `<div class="table-wrap"><table><thead><tr>${headers.map(h => `<th>${h}</th>`).join('')}</tr></thead><tbody>${rows.length ? rows.join('') : `<tr><td colspan="${headers.length}" class="empty">No records found.</td></tr>`}</tbody></table></div>`; }
+function pill(status) {
+  const c = ['NEGATIVE', 'OUT OF STOCK', 'Rejected', 'Disabled', 'Cancelled'].includes(status) ? 'bad' : ['LOW STOCK', 'PendingApproval', 'Pending', 'InTransit', 'Requested', 'Open'].includes(status) ? 'warn' : '';
+  return `<span class="pill ${c}">${esc(status || '—')}</span>`;
+}
+function opts(list, valueFn, labelFn, selected) { return list.map(x => `<option value="${esc(valueFn(x))}"${valueFn(x) === selected ? ' selected' : ''}>${esc(labelFn(x))}</option>`).join(''); }
+function noteBox(msg) { return `<div class="inline-note">${esc(msg)}</div>`; }
+
+/* ---------- auth ---------- */
+function showAuth() {
+  $('app').hidden = true; $('auth').hidden = false;
+  call('getSetupStatus').then(s => {
+    $('loginPanel').hidden = !s.adminExists; $('bootstrapPanel').hidden = !!s.adminExists;
+  }).catch(() => { });
+}
+async function doBootstrap() {
+  await run(async () => {
+    const d = { token: $('bootToken').value.trim(), businessName: $('bootBusiness').value.trim(), fullName: $('bootName').value.trim(), username: $('bootUser').value.trim(), password: $('bootPass').value };
+    const r = await call('bootstrapFirstAdmin', d);
+    toast(r.message);
+    $('bootstrapPanel').hidden = true; $('loginPanel').hidden = false;
+    $('loginUser').value = d.username; $('loginPass').value = ''; $('bootPass').value = ''; $('bootToken').value = '';
+  });
+}
+async function doLogin() {
+  await run(async () => {
+    const r = await call('login', $('loginUser').value.trim(), $('loginPass').value);
+    TOKEN = r.token; ME = r.user; $('loginPass').value = '';
+    $('auth').hidden = true; $('app').hidden = false;
+    $('topName').textContent = ME.fullName;
+    $('userBadge').innerHTML = '<b>' + esc(ME.fullName) + '</b><br>' + esc(ME.role);
+    document.querySelectorAll('.nav-item[data-view]').forEach(b => { b.hidden = !can(NAV_PERMS[b.dataset.view]); });
+    if (ME.mustChange) { showView('password'); toast('First login: change your temporary password before continuing.'); }
+    else showView('dashboard');
+  });
+}
+async function doLogout() {
+  try { if (TOKEN) await call('logout', TOKEN); } catch (e) { }
+  TOKEN = ''; ME = null; showAuth();
+}
+
+/* ---------- navigation ---------- */
+function showView(v) {
+  if (ME && ME.mustChange && v !== 'password') v = 'password';
+  CURRENT = v; COUNT_OPEN = null;
+  document.querySelectorAll('.nav-item[data-view]').forEach(b => b.classList.toggle('active', b.dataset.view === v));
+  $('pageTitle').textContent = TITLES[v] || v;
+  const f = {
+    dashboard: renderDashboard, inventory: renderInventory, items: () => renderMaster('items'), locations: () => renderMaster('locations'),
+    categories: () => renderMaster('categories'), units: () => renderMaster('units'), suppliers: () => renderMaster('suppliers'),
+    users: renderUsers, transactions: renderTransactions, transfers: renderTransfers, counts: renderCounts, reports: renderReports, password: renderPassword
+  };
+  (f[v] || renderDashboard)().catch(e => {
+    $('view').innerHTML = panel(esc(TITLES[v] || v), noteBox(e.message));
+    toast(e.message, true);
+  });
+}
+
+/* ---------- dashboard ---------- */
+async function renderDashboard() {
+  const d = await call('dashboard', TOKEN);
+  $('view').innerHTML = `<div class="grid">${stat('ACTIVE ITEMS', d.items, 'Registered inventory items')}${stat('LOCATIONS', d.locations, 'Warehouses / stores')}${stat('NEGATIVE BALANCES', d.negative, 'Requires investigation')}${stat('LOW / OUT OF STOCK', d.low, 'At or below reorder level')}</div><div style="height:18px"></div>`
+    + panel('Welcome to UIMS', `<p>Welcome, <b>${esc(d.user)}</b>. You are signed in as ${esc(d.role)}.</p><p class="muted">Setup order: Units → Locations → Categories → Items → (optional) unit conversions → Receive stock.</p><div class="inline-note">Negative On-Hand is allowed as configured. It is a discrepancy signal and does not automatically mean inventory loss.</div>`)
+    + panel('Quick actions', `<div class="toolbar">${can(['receive_stock', 'issue_stock', 'adjust_stock']) ? `<button class="primary" onclick="showView('transactions')">＋ New transaction</button>` : ''}${can(['manage_items']) ? `<button class="secondary" onclick="showView('items')">＋ Add item</button>` : ''}${can(['view_reports']) ? `<button class="secondary" onclick="showView('inventory')">View inventory</button>` : ''}</div>`);
+}
+
+/* ---------- master data ---------- */
+const SINGULAR = { items: 'item', locations: 'location', categories: 'category', units: 'unit', suppliers: 'supplier' };
+const WRITE_PERM = { items: 'manage_items', locations: 'manage_locations', categories: 'manage_items', units: 'manage_items', suppliers: 'manage_items' };
+
+async function renderMaster(kind) {
+  const data = await call('listData', TOKEN, kind);
+  let units = [], cats = [], itemUnits = [];
+  if (kind === 'items') {
+    [units, cats, itemUnits] = await Promise.all([call('listData', TOKEN, 'units'), call('listData', TOKEN, 'categories'), call('listItemUnits', TOKEN)]);
+  }
+  const unitName = id => { const u = units.find(x => x.id === id); return u ? u.values[2] + ' (' + u.values[3] + ')' : id; };
+  const catName = id => { const c = cats.find(x => x.id === id); return c ? c.values[2] : ''; };
+  let headers, rows;
+  if (kind === 'items') {
+    headers = ['SKU', 'Item name', 'Category', 'Base unit', 'Reorder level', 'Expiry', 'Status'];
+    rows = data.map(x => { const r = x.values; return `<tr><td>${esc(r[2])}</td><td><b>${esc(r[3])}</b></td><td>${esc(catName(r[4]))}</td><td>${esc(unitName(r[5]))}</td><td>${esc(r[6])}</td><td>${r[7] === true || r[7] === 'TRUE' ? 'Tracked' : 'No'}</td><td>${pill(r[8])}</td></tr>`; });
+  } else if (kind === 'locations') { headers = ['Location', 'Status', 'ID']; rows = data.map(x => `<tr><td><b>${esc(x.values[2])}</b></td><td>${pill(x.values[3])}</td><td>${esc(x.id)}</td></tr>`); }
+  else if (kind === 'categories') { headers = ['Category', 'ID', 'Created']; rows = data.map(x => `<tr><td><b>${esc(x.values[2])}</b></td><td>${esc(x.id)}</td><td>${fmt(x.values[3])}</td></tr>`); }
+  else if (kind === 'units') { headers = ['Unit', 'Abbreviation', 'ID']; rows = data.map(x => `<tr><td><b>${esc(x.values[2])}</b></td><td>${esc(x.values[3])}</td><td>${esc(x.id)}</td></tr>`); }
+  else { headers = ['Supplier', 'Contact', 'Status']; rows = data.map(x => `<tr><td><b>${esc(x.values[2])}</b></td><td>${esc(x.values[3])}</td><td>${pill(x.values[4])}</td></tr>`); }
+
+  let html = '';
+  if (can([WRITE_PERM[kind]])) html += panel('Add ' + SINGULAR[kind], masterForm(kind, units, cats));
+  html += panel(esc(TITLES[kind]) + ' list', table(headers, rows), `<span class="muted small">${data.length} records</span>`);
+  if (kind === 'items' && can(['manage_items'])) {
+    const itemName = id => { const i = data.find(x => x.id === id); return i ? i.values[3] : id; };
+    const base = data.map(x => unitName(x.values[5]));
+    html += panel('Unit conversions (optional)',
+      `<p class="muted small">Gamitin kung tumatanggap/nag-iissue ka sa ibang unit. Halimbawa: 1 Box = 12 Piece (Piece ang base unit).</p>
+       <div class="form-grid"><div><label>Item</label><select id="cvItem">${opts(data, x => x.id, x => x.values[3] + ' · base: ' + unitName(x.values[5]))}</select></div>
+       <div><label>Alternate unit</label><select id="cvUnit">${opts(units, x => x.id, x => x.values[2] + ' (' + x.values[3] + ')')}</select></div>
+       <div><label>How many BASE units in 1 alternate unit?</label><input id="cvFactor" type="number" min="0.000001" step="any" value="1"></div></div>
+       <div class="form-actions"><button class="primary" onclick="run(saveConversionUI)">Save conversion</button></div>`
+      + table(['Item', 'Unit', 'Base units per 1 unit'], itemUnits.map(c => `<tr><td>${esc(itemName(c.itemId))}</td><td>${esc(unitName(c.unitId))}</td><td>${esc(c.factor)}</td></tr>`)));
+  }
+  $('view').innerHTML = html;
+}
+function masterForm(kind, units, cats) {
+  let fields = '';
+  if (kind === 'items') {
+    fields = `<div><label>SKU / Barcode</label><input id="mSku" placeholder="SKU-001"></div><div><label>Item name *</label><input id="mName"></div>
+      <div><label>Category (optional)</label><select id="mCategory"><option value="">— none —</option>${opts(cats, x => x.id, x => x.values[2])}</select></div>
+      <div><label>Base unit *</label><select id="mBaseUnit">${units.length ? opts(units, x => x.id, x => x.values[2] + ' (' + x.values[3] + ')') : '<option value="">Create a Unit first</option>'}</select></div>
+      <div><label>Reorder level (base unit)</label><input id="mReorder" type="number" min="0" value="0"></div>
+      <div><label>Track expiry?</label><select id="mExpiry"><option value="false">No</option><option value="true">Yes</option></select></div>`;
+  } else if (kind === 'units') fields = `<div><label>Unit name *</label><input id="mName" placeholder="Piece"></div><div><label>Abbreviation</label><input id="mAbbr" placeholder="pc"></div>`;
+  else if (kind === 'suppliers') fields = `<div><label>Supplier name *</label><input id="mName"></div><div><label>Contact details</label><input id="mContact" placeholder="Phone / email"></div>`;
+  else fields = `<div class="field-full"><label>${kind === 'locations' ? 'Location name' : 'Category name'} *</label><input id="mName"></div>`;
+  return `<div class="form-grid">${fields}</div><div class="form-actions"><button class="primary" onclick="run(()=>saveMasterUI('${kind}'))">Save ${SINGULAR[kind]}</button></div>`;
+}
+async function saveMasterUI(kind) {
+  const d = { name: ($('mName').value || '').trim() };
+  if (kind === 'items') Object.assign(d, { sku: $('mSku').value, categoryId: $('mCategory').value, baseUnitId: $('mBaseUnit').value, reorderLevel: $('mReorder').value, trackExpiry: $('mExpiry').value === 'true' });
+  if (kind === 'units') d.abbreviation = $('mAbbr').value;
+  if (kind === 'suppliers') d.contact = $('mContact').value;
+  await call('saveMaster', TOKEN, kind, d);
+  toast('Saved successfully.');
+  await renderMaster(kind);
+}
+async function saveConversionUI() {
+  await call('saveItemUnit', TOKEN, { itemId: $('cvItem').value, unitId: $('cvUnit').value, factor: $('cvFactor').value });
+  toast('Conversion saved.');
+  await renderMaster('items');
+}
+
+/* ---------- inventory ---------- */
+async function renderInventory(locationId) {
+  let locs = [];
+  try { locs = await call('listData', TOKEN, 'locations'); } catch (e) { }
+  const data = await call('inventory', TOKEN, locationId || '');
+  const showCost = data.some(x => x.valuation !== null);
+  const rows = data.map(x => `<tr><td>${esc(x.sku)}</td><td><b>${esc(x.name)}</b><br><span class="muted">${esc(x.category)}</span></td><td>${Number(x.qty).toLocaleString()} ${esc(x.unit)}</td><td>${pill(x.status)}</td>${showCost ? `<td>${x.valuation === null ? '—' : money(x.valuation)}</td>` : ''}</tr>`);
+  const filter = `<div class="toolbar"><select id="invLoc" onchange="renderInventory(this.value).catch(e=>toast(e.message,true))"><option value="">All locations</option>${opts(locs, x => x.id, x => x.values[2], locationId || '')}</select><button class="secondary" onclick="showView('reports')">Reports / Export</button></div>`;
+  $('view').innerHTML = panel('Stock on hand', table(['SKU', 'Item', 'Quantity (base unit)', 'Status'].concat(showCost ? ['FIFO valuation'] : []), rows), filter);
+}
+
+/* ---------- users ---------- */
+async function renderUsers() {
+  const [users, perms] = await Promise.all([call('listUsers', TOKEN), call('getPermissions', TOKEN)]);
+  const check = perms.map(p => `<label><input type="checkbox" name="userperm" value="${esc(p.key)}"> ${esc(p.description)}</label>`).join('');
+  const form = `<div class="form-grid"><div><label>Full name *</label><input id="uName"></div><div><label>Username *</label><input id="uUsername" autocomplete="off"></div>
+    <div><label>Temporary password *</label><input id="uPassword" type="password" autocomplete="new-password"><div class="small muted">10+ characters; letters and numbers. User must change it at first login.</div></div>
+    <div><label>Role</label><select id="uRole"><option value="WarehouseStaff">Warehouse Staff</option><option value="Supervisor">Supervisor</option>${ME.role === 'BusinessAdmin' ? '<option value="BusinessAdmin">Business Admin</option>' : ''}</select></div></div>
+    <label>Permissions (hindi kailangan para sa Business Admin)</label><div class="checkbox-list">${check}</div>
+    <div class="form-actions"><button class="primary" onclick="run(createUserUI)">Create user</button></div>`;
+  const rows = users.map(u => `<tr><td><b>${esc(u.fullName)}</b><br><span class="muted">${esc(u.username)}</span></td><td>${esc(u.role)}</td><td>${pill(u.status)}</td><td>${u.mustChange ? 'Required' : 'No'}</td>
+    <td><div class="actions"><button class="secondary" onclick="run(()=>toggleUser('${esc(u.id)}','${u.status === 'Active' ? 'Disabled' : 'Active'}'))">${u.status === 'Active' ? 'Disable' : 'Enable'}</button>
+    ${u.role !== 'BusinessAdmin' ? `<button class="secondary" onclick="run(()=>editPerms('${esc(u.id)}','${esc(u.fullName)}'))">Permissions</button>` : ''}
+    <button class="secondary" onclick="run(()=>resetPw('${esc(u.id)}'))">Reset password</button></div></td></tr>`);
+  window.__perms = perms;
+  $('view').innerHTML = panel('Create user account', form) + '<div id="permEditor"></div>' + panel('Business users', table(['User', 'Role', 'Status', 'Must change password', 'Actions'], rows));
+}
+async function createUserUI() {
+  const d = { fullName: $('uName').value, username: $('uUsername').value, password: $('uPassword').value, role: $('uRole').value, permissions: [...document.querySelectorAll('input[name=userperm]:checked')].map(x => x.value) };
+  const r = await call('createUser', TOKEN, d);
+  toast(r.message);
+  await renderUsers();
+}
+async function toggleUser(id, status) { await call('setUserStatus', TOKEN, id, status); toast('Account status updated.'); await renderUsers(); }
+async function resetPw(id) {
+  const pw = prompt('Enter a NEW temporary password (10+ characters, letters and numbers):');
+  if (!pw) return;
+  const r = await call('resetUserPassword', TOKEN, id, pw);
+  toast(r.message);
+  await renderUsers();
+}
+async function editPerms(id, name) {
+  const cur = await call('getUserPermissions', TOKEN, id);
+  const check = window.__perms.map(p => `<label><input type="checkbox" name="editperm" value="${esc(p.key)}"${cur.includes(p.key) ? ' checked' : ''}> ${esc(p.description)}</label>`).join('');
+  $('permEditor').innerHTML = panel('Permissions: ' + esc(name), `<div class="checkbox-list">${check}</div><div class="form-actions"><button class="secondary" onclick="document.getElementById('permEditor').innerHTML=''">Cancel</button><button class="primary" onclick="run(()=>savePerms('${esc(id)}'))">Save permissions</button></div>`);
+  $('permEditor').scrollIntoView({ behavior: 'smooth' });
+}
+async function savePerms(id) {
+  await call('setPermissions', TOKEN, id, [...document.querySelectorAll('input[name=editperm]:checked')].map(x => x.value));
+  toast('Permissions saved.');
+  $('permEditor').innerHTML = '';
+}
+
+/* ---------- password ---------- */
+async function renderPassword() {
+  $('view').innerHTML = panel('Change password', `<div class="form-grid"><div class="field-full"><label>Current / temporary password</label><input id="oldPw" type="password" autocomplete="current-password"></div><div><label>New password</label><input id="newPw" type="password" autocomplete="new-password"></div><div><label>Confirm new password</label><input id="confirmPw" type="password" autocomplete="new-password"></div></div><div class="small muted">Use at least 10 characters, including letters and numbers.</div><div class="form-actions"><button class="primary" onclick="run(savePassword)">Update password</button></div>`);
+}
+async function savePassword() {
+  if ($('newPw').value !== $('confirmPw').value) throw new Error('New passwords do not match.');
+  await call('changePassword', TOKEN, $('oldPw').value, $('newPw').value);
+  ME.mustChange = false;
+  toast('Password changed successfully.');
+  showView('dashboard');
+}
+
+/* ---------- transactions (multi-line) ---------- */
+function unitChoices(itemId) {
+  const d = TX_DATA, it = d.items.find(x => x.id === itemId);
+  if (!it) return [];
+  const list = [], base = d.units.find(u => u.id === it.values[5]);
+  if (base) list.push({ id: base.id, label: base.values[2] + ' (' + base.values[3] + ') · base', factor: 1 });
+  d.itemUnits.filter(c => c.itemId === itemId).forEach(c => { const u = d.units.find(x => x.id === c.unitId); if (u) list.push({ id: u.id, label: u.values[2] + ' (' + u.values[3] + ') · ×' + c.factor, factor: c.factor }); });
+  return list;
+}
+async function renderTransactions() {
+  TX_LINES = [];
+  const canPost = can(['receive_stock', 'issue_stock', 'adjust_stock']), canApprove = can(['approve_transactions']);
+  let html = '';
+  if (canPost) {
+    const [items, locs, units, itemUnits] = await Promise.all([call('listData', TOKEN, 'items'), call('listData', TOKEN, 'locations'), call('listData', TOKEN, 'units'), call('listItemUnits', TOKEN)]);
+    TX_DATA = { items: items.filter(x => x.values[8] === 'Active'), locs: locs.filter(x => x.values[3] === 'Active'), units: units, itemUnits: itemUnits };
+    const types = [];
+    if (can(['receive_stock'])) types.push('<option value="RECEIVE">Receive stock</option>');
+    if (can(['issue_stock'])) types.push('<option value="ISSUE">Issue stock</option>');
+    if (can(['adjust_stock'])) types.push('<option value="ADJ_PLUS">Adjustment (+) add stock</option><option value="ADJ_MINUS">Adjustment (−) remove stock</option>');
+    html += panel('Post inventory transaction', `<div class="inline-note">Receiving adds stock and FIFO cost layers. Issuing consumes FIFO layers. Adjustments need approval unless you have approval permission. Walang masusulat hangga't hindi mo pinipindot ang "Post transaction".</div>
+      <div class="form-grid"><div><label>Transaction type</label><select id="txType">${types.join('')}</select></div><div><label>Location</label><select id="txLocation">${opts(TX_DATA.locs, x => x.id, x => x.values[2])}</select></div>
+      <div><label>Reference / PO</label><input id="txRef" placeholder="PO / document number"></div><div><label>Notes</label><input id="txNotes"></div></div>
+      <hr style="border:0;border-top:1px solid #edf1ee;margin:20px 0">
+      <div class="form-grid"><div class="field-full"><label>Scan / type SKU (Enter)</label><input id="txScan" placeholder="Scan barcode or type SKU then press Enter" autocomplete="off"></div>
+      <div><label>Item</label><select id="txItem" onchange="txItemChanged()">${opts(TX_DATA.items, x => x.id, x => x.values[3] + (x.values[2] ? ' (' + x.values[2] + ')' : ''))}</select></div>
+      <div><label>Quantity</label><input id="txQty" type="number" min="0.001" step="any" value="1"></div>
+      <div><label>Unit</label><select id="txUnit"></select></div><div><label>Unit cost (per selected unit; for receive / adjustment +)</label><input id="txCost" type="number" min="0" step="any" value="0"></div>
+      <div><label>Batch / lot</label><input id="txBatch"></div><div><label>Expiry date (required for tracked items)</label><input id="txExpiry" type="date"></div></div>
+      <div class="form-actions"><button class="secondary" onclick="txAddLine()">＋ Add line</button></div>
+      <div id="txCart"></div>
+      <div class="form-actions"><button class="primary" onclick="run(postTxUI)">Post transaction</button></div>`);
+  }
+  if (canApprove) {
+    const pend = await call('listPendingApprovals', TOKEN);
+    html += panel('Pending approvals', table(['Created', 'Type', 'Location', 'Requested by', 'Lines', 'Reference', 'Actions'], pend.map(p => `<tr><td>${fmt(p.createdAt)}</td><td>${esc(p.type)}</td><td>${esc(p.location)}</td><td>${esc(p.requestedBy)}</td><td>${esc(p.summary)}</td><td>${esc(p.reference)}</td><td><div class="actions"><button class="primary" onclick="run(()=>decide('${esc(p.id)}','Approve'))">Approve</button><button class="danger" onclick="run(()=>decide('${esc(p.id)}','Reject'))">Reject</button></div></td></tr>`)));
+  }
+  if (!html) throw new Error('You do not have permission to use transactions.');
+  $('view').innerHTML = html;
+  if (canPost) {
+    txItemChanged(); txRenderCart();
+    $('txScan').addEventListener('keydown', e => { if (e.key === 'Enter') { e.preventDefault(); txScan(); } });
+  }
+}
+function txItemChanged() {
+  const id = $('txItem').value, ch = unitChoices(id);
+  $('txUnit').innerHTML = ch.map(c => `<option value="${esc(c.id)}">${esc(c.label)}</option>`).join('');
+}
+function txScan() {
+  const code = $('txScan').value.trim().toLowerCase();
+  if (!code) return;
+  const it = TX_DATA.items.find(x => String(x.values[2]).toLowerCase() === code);
+  if (!it) { toast('SKU not found: ' + code, true); return; }
+  $('txItem').value = it.id; txItemChanged(); $('txScan').value = ''; $('txQty').focus(); $('txQty').select();
+}
+function txAddLine() {
+  const itemId = $('txItem').value, it = TX_DATA.items.find(x => x.id === itemId);
+  if (!it) return toast('Choose an item.', true);
+  const qty = Number($('txQty').value);
+  if (!(qty > 0)) return toast('Quantity must be greater than zero.', true);
+  const unitId = $('txUnit').value, u = unitChoices(itemId).find(c => c.id === unitId);
+  const type = $('txType').value, tracked = it.values[7] === true || it.values[7] === 'TRUE';
+  if (tracked && (type === 'RECEIVE' || type === 'ADJ_PLUS') && !$('txExpiry').value) return toast('Expiry date is required for ' + it.values[3] + '.', true);
+  TX_LINES.push({ itemId: itemId, name: it.values[3], qty: qty, unitId: unitId, unitLabel: u ? u.label.split(' · ')[0] : '', unitCost: $('txCost').value || 0, batchNo: $('txBatch').value, expiryDate: $('txExpiry').value });
+  $('txQty').value = 1; $('txBatch').value = ''; $('txExpiry').value = '';
+  txRenderCart();
+}
+function txRemoveLine(i) { TX_LINES.splice(i, 1); txRenderCart(); }
+function txRenderCart() {
+  $('txCart').innerHTML = TX_LINES.length ? table(['Item', 'Qty', 'Unit', 'Unit cost', 'Batch', 'Expiry', ''], TX_LINES.map((l, i) => `<tr><td><b>${esc(l.name)}</b></td><td>${esc(l.qty)}</td><td>${esc(l.unitLabel)}</td><td>${esc(l.unitCost)}</td><td>${esc(l.batchNo)}</td><td>${esc(l.expiryDate)}</td><td><button class="danger" onclick="txRemoveLine(${i})">Remove</button></td></tr>`))
+    : `<p class="muted small" style="margin:14px 0 0">No lines yet. Add at least one item line.</p>`;
+}
+async function postTxUI() {
+  if (!TX_LINES.length) throw new Error('Add at least one line first.');
+  const t = $('txType').value, sign = t === 'ADJ_MINUS' ? -1 : 1;
+  const d = { type: t.startsWith('ADJ') ? 'ADJUST' : t, locationId: $('txLocation').value, reference: $('txRef').value, notes: $('txNotes').value,
+    lines: TX_LINES.map(l => ({ itemId: l.itemId, qty: l.qty, unitId: l.unitId, unitCost: l.unitCost, batchNo: l.batchNo, expiryDate: l.expiryDate, adjustSign: sign })) };
+  const r = await call('postTransaction', TOKEN, d);
+  toast(r.message + ' ID: ' + r.transactionId);
+  await renderTransactions();
+}
+async function decide(id, decision) {
+  let reason = '';
+  if (decision === 'Reject') { reason = prompt('Reason for rejection:') || ''; if (!reason) return; }
+  else if (!confirm('Approve this transaction? Stock will be updated.')) return;
+  await call('approveTransaction', TOKEN, id, decision, reason);
+  toast('Transaction ' + (decision === 'Approve' ? 'approved and posted.' : 'rejected.'));
+  await renderTransactions();
+}
+
+/* ---------- transfers ---------- */
+async function renderTransfers() {
+  let html = '';
+  const canCreate = can(['transfer_stock']);
+  if (canCreate) {
+    const [items, locs, units, itemUnits] = await Promise.all([call('listData', TOKEN, 'items'), call('listData', TOKEN, 'locations'), call('listData', TOKEN, 'units'), call('listItemUnits', TOKEN)]);
+    TX_DATA = { items: items.filter(x => x.values[8] === 'Active'), locs: locs.filter(x => x.values[3] === 'Active'), units: units, itemUnits: itemUnits };
+    html += panel('Create transfer request', `<div class="form-grid"><div><label>From location</label><select id="trFrom">${opts(TX_DATA.locs, x => x.id, x => x.values[2])}</select></div><div><label>To location</label><select id="trTo">${opts(TX_DATA.locs, x => x.id, x => x.values[2])}</select></div>
+      <div><label>Item</label><select id="trItem" onchange="trItemChanged()">${opts(TX_DATA.items, x => x.id, x => x.values[3])}</select></div><div><label>Quantity</label><input id="trQty" type="number" min="0.001" step="any" value="1"></div>
+      <div><label>Unit</label><select id="trUnit"></select></div><div><label>Reference / notes</label><input id="trNotes"></div></div>
+      <div class="form-actions"><button class="primary" onclick="run(createTransferUI)">Request transfer</button></div>
+      <p class="small muted">Request = walang nagagalaw na stock. Bababa ang stock sa source pag na-Dispatch, at tataas sa destination pag na-Receive.</p>`);
+  }
+  const list = await call('listTransfers', TOKEN);
+  const rows = list.map(t => `<tr><td>${esc(t.id)}</td><td>${esc(t.from)} → ${esc(t.to)}</td><td>${esc(t.summary)}</td><td>${pill(t.status)}</td><td>${fmt(t.dispatchedAt)}</td><td>${fmt(t.receivedAt)}</td><td><div class="actions">
+    ${t.status === 'Requested' && can(['transfer_stock']) ? `<button class="primary" onclick="run(()=>dispatchUI('${esc(t.id)}'))">Dispatch</button>` : ''}
+    ${t.status === 'InTransit' && can(['confirm_transfers']) ? `<button class="primary" onclick="run(()=>receiveUI('${esc(t.id)}'))">Receive</button>` : ''}</div></td></tr>`);
+  html += panel('Transfers', table(['ID', 'Route', 'Items', 'Status', 'Dispatched', 'Received', 'Actions'], rows));
+  $('view').innerHTML = html;
+  if (canCreate) trItemChanged();
+}
+function trItemChanged() { $('trUnit').innerHTML = unitChoices($('trItem').value).map(c => `<option value="${esc(c.id)}">${esc(c.label)}</option>`).join(''); }
+async function createTransferUI() {
+  const r = await call('createTransfer', TOKEN, { from: $('trFrom').value, to: $('trTo').value, reference: $('trNotes').value, notes: $('trNotes').value, lines: [{ itemId: $('trItem').value, qty: $('trQty').value, unitId: $('trUnit').value }] });
+  toast('Transfer requested: ' + r.transferId);
+  await renderTransfers();
+}
+async function dispatchUI(id) { if (!confirm('Dispatch this transfer? Stock will leave the source location.')) return; await call('dispatchTransfer', TOKEN, id); toast('Transfer dispatched.'); await renderTransfers(); }
+async function receiveUI(id) { const n = prompt('Receiving notes / discrepancies (optional):'); if (n === null) return; await call('receiveTransfer', TOKEN, id, n); toast('Transfer received.'); await renderTransfers(); }
+
+/* ---------- stock counts ---------- */
+async function renderCounts() {
+  if (COUNT_OPEN) return renderCountSheet(COUNT_OPEN);
+  const [locs, counts] = await Promise.all([call('listData', TOKEN, 'locations'), call('listCounts', TOKEN)]);
+  $('view').innerHTML = panel('Start stock count', `<div class="form-grid"><div><label>Location</label><select id="countLoc">${opts(locs, x => x.id, x => x.values[2])}</select></div><div><label>Notes</label><input id="countNotes"></div></div>
+    <div class="form-actions"><button class="primary" onclick="run(startCountUI)">Create stock count</button></div><p class="small muted">Kumukuha ng snapshot ng expected balances. Ilagay ang physical count ng bawat item, i-save, tapos i-post para maayos ang balances.</p>`)
+    + panel('Stock counts', table(['Created', 'Location', 'Status', 'Notes', 'Actions'], counts.map(c => `<tr><td>${fmt(c.createdAt)}</td><td>${esc(c.location)}</td><td>${pill(c.status)}</td><td>${esc(c.notes)}</td><td>${c.status === 'Open' ? `<button class="primary" onclick="run(()=>openCount('${esc(c.id)}'))">Enter counts</button>` : fmt(c.postedAt)}</td></tr>`)));
+}
+async function startCountUI() {
+  const r = await call('createStockCount', TOKEN, { locationId: $('countLoc').value, notes: $('countNotes').value });
+  toast('Stock count created.');
+  await openCount(r.countId);
+}
+async function openCount(id) { COUNT_OPEN = id; await renderCountSheet(id); }
+async function renderCountSheet(id) {
+  const c = await call('getCount', TOKEN, id);
+  const rows = c.lines.map(l => `<tr><td>${esc(l.sku)}</td><td><b>${esc(l.name)}</b></td><td>${esc(l.expected)} ${esc(l.unit)}</td><td><input class="cnt" data-item="${esc(l.itemId)}" data-exp="${esc(l.expected)}" type="number" min="0" step="any" value="${l.counted == null ? '' : esc(l.counted)}" oninput="cntVar(this)" style="width:110px"></td><td class="var">${l.counted == null ? '' : esc(Math.round((l.counted - l.expected) * 1e6) / 1e6)}</td></tr>`);
+  $('view').innerHTML = panel('Stock count · ' + esc(c.location), table(['SKU', 'Item', 'Expected', 'Counted', 'Variance'], rows),
+    `<div class="toolbar"><button class="secondary" onclick="COUNT_OPEN=null;showView('counts')">← Back</button><button class="secondary" onclick="run(saveCountUI)">Save progress</button><button class="primary" onclick="run(postCountUI)">Post count</button><button class="danger" onclick="run(cancelCountUI)">Cancel count</button></div>`);
+}
+function cntVar(el) {
+  const v = el.value === '' ? '' : Math.round((Number(el.value) - Number(el.dataset.exp)) * 1e6) / 1e6;
+  el.closest('tr').querySelector('.var').textContent = v;
+}
+function collectCount() { return [...document.querySelectorAll('input.cnt')].map(i => ({ itemId: i.dataset.item, countedQty: i.value })); }
+async function saveCountUI() { const r = await call('saveCountLines', TOKEN, COUNT_OPEN, collectCount()); toast('Saved ' + r.saved + ' lines.'); }
+async function postCountUI() {
+  if (collectCount().some(l => l.countedQty === '')) throw new Error('Count every item before posting.');
+  if (!confirm('Post this count? Balances will be adjusted to the counted quantities.')) return;
+  await call('saveCountLines', TOKEN, COUNT_OPEN, collectCount());
+  await call('postStockCount', TOKEN, COUNT_OPEN);
+  toast('Stock count posted.'); COUNT_OPEN = null; showView('counts');
+}
+async function cancelCountUI() { if (!confirm('Cancel this count? No balances will change.')) return; await call('cancelStockCount', TOKEN, COUNT_OPEN); toast('Count cancelled.'); COUNT_OPEN = null; showView('counts'); }
+
+/* ---------- reports ---------- */
+async function renderReports(from, to) {
+  const tx = await call('reportTransactions', TOKEN, from || '', to || '');
+  const rows = tx.slice(-200).reverse().map(x => `<tr><td>${fmt(x.createdAt)}</td><td>${esc(x.type)}</td><td>${esc(x.reference)}</td><td>${esc(x.location)}</td><td>${pill(x.status)}</td><td>${esc(x.createdBy)}</td><td>${esc(x.id)}</td></tr>`);
+  $('view').innerHTML = panel('Export inventory', `<p class="muted">Download the current inventory list as CSV. Open it in Excel or Google Sheets.</p><button class="primary" onclick="run(downloadCsv)">Download inventory CSV</button>`)
+    + panel('Transaction history (latest 200)', `<div class="toolbar" style="margin-bottom:12px"><input id="rFrom" type="date" value="${esc(from || '')}"><input id="rTo" type="date" value="${esc(to || '')}"><button class="secondary" onclick="renderReports(document.getElementById('rFrom').value,document.getElementById('rTo').value).catch(e=>toast(e.message,true))">Filter</button></div>`
+      + table(['Created', 'Type', 'Reference', 'Location / route', 'Status', 'User', 'Transaction ID'], rows));
+}
+async function downloadCsv() {
+  const csv = await call('exportInventoryCsv', TOKEN);
+  const blob = new Blob(['\uFEFF' + csv], { type: 'text/csv;charset=utf-8;' }), url = URL.createObjectURL(blob), a = document.createElement('a');
+  a.href = url; a.download = 'UIMS_Inventory.csv'; document.body.appendChild(a); a.click(); a.remove(); URL.revokeObjectURL(url);
+  toast('CSV export prepared.');
+}
+
+/* ---------- start ---------- */
+window.addEventListener('load', () => {
+  showAuth();
+  ['loginUser', 'loginPass'].forEach(id => $(id).addEventListener('keydown', e => { if (e.key === 'Enter') doLogin(); }));
+});
